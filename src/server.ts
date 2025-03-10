@@ -59,6 +59,13 @@ db.exec(`
     createdAt TEXT NOT NULL,
     posted BOOLEAN NOT NULL DEFAULT 0
   );
+  
+  CREATE TABLE IF NOT EXISTS processed_posts (
+    uri TEXT PRIMARY KEY,
+    cid TEXT NOT NULL,
+    processedAt TEXT NOT NULL,
+    noteCount INTEGER NOT NULL DEFAULT 0
+  );
 `);
 
 // Initialize Hono app
@@ -170,16 +177,40 @@ const saveCommunityNote = (
   );
 };
 
+// Mark community note as posted
+const markCommunityNoteAsPosted = (id: string): void => {
+  const stmt = db.prepare("UPDATE community_notes SET posted = 1 WHERE id = ?");
+  stmt.run(id);
+};
+
+// Delete community notes for a post
+const deleteCommunityNotesForPost = (originalPostUri: string): void => {
+  const stmt = db.prepare("DELETE FROM community_notes WHERE originalPostUri = ?");
+  stmt.run(originalPostUri);
+  console.log(`Deleted existing community notes for post ${originalPostUri}`);
+};
+
 // Mark comment as processed
 const markCommentAsProcessed = (id: string): void => {
   const stmt = db.prepare("UPDATE comments SET processed = 1 WHERE id = ?");
   stmt.run(id);
 };
 
-// Mark community note as posted
-const markCommunityNoteAsPosted = (id: string): void => {
-  const stmt = db.prepare("UPDATE community_notes SET posted = 1 WHERE id = ?");
-  stmt.run(id);
+// Mark post as processed
+const markPostAsProcessed = (uri: string, cid: string, noteCount: number): void => {
+  const stmt = db.prepare(`
+    INSERT OR REPLACE INTO processed_posts (uri, cid, processedAt, noteCount)
+    VALUES (?, ?, ?, ?)
+  `);
+  stmt.run(uri, cid, new Date().toISOString(), noteCount);
+  console.log(`Marked post ${uri} as processed with ${noteCount} notes`);
+};
+
+// Check if a post has been processed
+const isPostProcessed = (uri: string): boolean => {
+  const stmt = db.prepare("SELECT COUNT(*) as count FROM processed_posts WHERE uri = ?");
+  const result = stmt.get(uri) as { count: number };
+  return result.count > 0;
 };
 
 // Get all comments for a post
@@ -192,16 +223,6 @@ const getAllCommentsForPost = (originalPostUri: string): Comment[] => {
     embedding: JSON.parse(row.embedding),
     processed: Boolean(row.processed),
   }));
-};
-
-// Check if a community note exists for a post
-const communityNoteExistsForPost = (originalPostUri: string): boolean => {
-  const stmt = db.prepare(
-    "SELECT COUNT(*) as count FROM community_notes WHERE originalPostUri = ? AND posted = 1"
-  );
-  const result = stmt.get(originalPostUri) as { count: number };
-
-  return result.count > 0;
 };
 
 // Generate a community note using OpenAI
@@ -288,24 +309,39 @@ const processSimilarComments = async (): Promise<void> => {
   try {
     // Get all unique original post URIs with at least MIN_COMMENTS_FOR_NOTE comments
     const postUrisStmt = db.prepare(`
-      SELECT originalPostUri, COUNT(*) as commentCount 
+      SELECT originalPostUri, originalPostCid, COUNT(*) as commentCount 
       FROM comments 
       GROUP BY originalPostUri 
       HAVING commentCount >= ?
     `);
     
-    const postUris = postUrisStmt.all(MIN_COMMENTS_FOR_NOTE) as { originalPostUri: string, commentCount: number }[];
+    const postUris = postUrisStmt.all(MIN_COMMENTS_FOR_NOTE) as { 
+      originalPostUri: string, 
+      originalPostCid: string,
+      commentCount: number 
+    }[];
     
     console.log(`Found ${postUris.length} posts with at least ${MIN_COMMENTS_FOR_NOTE} comments`);
     
-    for (const { originalPostUri, commentCount } of postUris) {
+    for (const { originalPostUri, originalPostCid, commentCount } of postUris) {
       console.log(`Processing post ${originalPostUri} with ${commentCount} comments`);
       
-      // Skip if a community note already exists for this post
-      if (communityNoteExistsForPost(originalPostUri)) {
-        console.log(`Skipping post ${originalPostUri} - community note already exists`);
+      // Check if we've already posted a note to this post
+      const hasExistingNote = await hasExistingNoteForPost(originalPostUri);
+      
+      if (hasExistingNote) {
+        console.log(`Skipping post ${originalPostUri} - already has a community note`);
+        
+        // Mark the post as processed if it's not already
+        if (!isPostProcessed(originalPostUri)) {
+          markPostAsProcessed(originalPostUri, originalPostCid, 1);
+        }
+        
         continue;
       }
+      
+      // Delete any existing community notes for this post from our database
+      deleteCommunityNotesForPost(originalPostUri);
       
       const comments = getAllCommentsForPost(originalPostUri);
       console.log(`Retrieved ${comments.length} comments for post ${originalPostUri}`);
@@ -350,6 +386,8 @@ const processSimilarComments = async (): Promise<void> => {
       console.log(`Found ${similarCommentGroups.length} groups of similar comments for post ${originalPostUri}`);
       
       // Generate and post community notes for each group of similar comments
+      let successfulNotes = 0;
+      
       for (const group of similarCommentGroups) {
         console.log(`Generating community note for group of ${group.length} comments`);
         console.log(`Comment texts in group: ${group.map(c => `"${c.text}"`).join(' | ')}`);
@@ -364,7 +402,7 @@ const processSimilarComments = async (): Promise<void> => {
         saveCommunityNote(
           noteId,
           originalPostUri,
-          group[0].originalPostCid,
+          originalPostCid,
           noteText,
           commentIds
         );
@@ -372,9 +410,10 @@ const processSimilarComments = async (): Promise<void> => {
         
         // Post the community note as a reply
         console.log(`Attempting to post community note as reply to ${originalPostUri}`);
-        const posted = await postReply(noteText, originalPostUri, group[0].originalPostCid);
+        const posted = await postReply(noteText, originalPostUri, originalPostCid);
         
         if (posted) {
+          successfulNotes++;
           console.log(`Successfully posted community note as reply`);
           // Mark the community note as posted
           markCommunityNoteAsPosted(noteId);
@@ -387,6 +426,11 @@ const processSimilarComments = async (): Promise<void> => {
         } else {
           console.log(`Failed to post community note as reply`);
         }
+      }
+      
+      // Mark the post as processed if we successfully posted at least one note
+      if (successfulNotes > 0) {
+        markPostAsProcessed(originalPostUri, originalPostCid, successfulNotes);
       }
     }
   } catch (error) {
@@ -525,15 +569,49 @@ const checkForMentions = async (): Promise<void> => {
       console.log(`Saved comment: ${comment.id}`);
     }
 
-    // Process similar comments to generate community notes
-    await processSimilarComments();
-
     // Mark notifications as read
     if (mentions.length > 0) {
       await agent.updateSeenNotifications();
     }
   } catch (error) {
     console.error("Error checking for mentions:", error);
+  }
+};
+
+// Check if we've already posted a note to this post
+const hasExistingNoteForPost = async (postUri: string): Promise<boolean> => {
+  try {
+    if (!agent.session) {
+      const loggedIn = await loginToBluesky();
+      if (!loggedIn) return false;
+    }
+
+    // Get our own DID
+    const profileResponse = await agent.getProfile({
+      actor: agent.session?.did || "",
+    });
+    const myDid = profileResponse.data.did;
+
+    // Get the thread for the post
+    const threadResponse = await agent.getPostThread({ uri: postUri });
+    const thread = threadResponse.data.thread;
+
+    // Check if any of the replies are from us
+    const threadAny = thread as any;
+    const replies = threadAny?.replies || [];
+
+    for (const reply of replies) {
+      if (reply?.post?.author?.did === myDid) {
+        // This is a reply from us
+        console.log(`Found existing note for post ${postUri}`);
+        return true;
+      }
+    }
+
+    return false;
+  } catch (error) {
+    console.error(`Error checking for existing note for post ${postUri}:`, error);
+    return false;
   }
 };
 
@@ -555,6 +633,22 @@ app.get("/status", (c) => {
   const postedCount = db
     .prepare("SELECT COUNT(*) as count FROM community_notes WHERE posted = 1")
     .get() as { count: number };
+  const processedPostsCount = db
+    .prepare("SELECT COUNT(*) as count FROM processed_posts")
+    .get() as { count: number };
+    
+  // Get posts with at least 3 comments
+  const postsWithCommentsStmt = db.prepare(`
+    SELECT originalPostUri, COUNT(*) as commentCount 
+    FROM comments 
+    GROUP BY originalPostUri 
+    HAVING commentCount >= ?
+  `);
+  const postsWithComments = postsWithCommentsStmt.all(MIN_COMMENTS_FOR_NOTE) as { originalPostUri: string, commentCount: number }[];
+  
+  // Get processed posts
+  const processedPostsStmt = db.prepare("SELECT * FROM processed_posts ORDER BY processedAt DESC");
+  const processedPosts = processedPostsStmt.all() as { uri: string, cid: string, processedAt: string, noteCount: number }[];
 
   return c.json({
     status: "running",
@@ -563,6 +657,18 @@ app.get("/status", (c) => {
     processedComments: processedCount.count,
     communityNotes: notesCount.count,
     postedNotes: postedCount.count,
+    processedPosts: processedPostsCount.count,
+    postsWithEnoughComments: postsWithComments.length,
+    posts: postsWithComments.map(p => ({
+      uri: p.originalPostUri,
+      commentCount: p.commentCount,
+      processed: processedPosts.some(pp => pp.uri === p.originalPostUri)
+    })),
+    recentlyProcessedPosts: processedPosts.slice(0, 10).map(p => ({
+      uri: p.uri,
+      processedAt: p.processedAt,
+      noteCount: p.noteCount
+    }))
   });
 });
 
@@ -576,19 +682,245 @@ app.post("/process-similar", async (c) => {
   return c.json({ success: true, message: "Processed similar comments" });
 });
 
+app.post("/process-post", async (c) => {
+  try {
+    const body = await c.req.json();
+    const { postUri } = body;
+    
+    if (!postUri) {
+      return c.json({ success: false, message: "Missing postUri parameter" }, 400);
+    }
+    
+    // Check if we've already posted a note to this post
+    const hasExistingNote = await hasExistingNoteForPost(postUri);
+    
+    if (hasExistingNote) {
+      return c.json({ 
+        success: false, 
+        message: `Post ${postUri} already has a community note` 
+      }, 400);
+    }
+    
+    // Delete any existing community notes for this post from our database
+    deleteCommunityNotesForPost(postUri);
+    
+    // Get comments for this post
+    const comments = getAllCommentsForPost(postUri);
+    
+    if (comments.length < MIN_COMMENTS_FOR_NOTE) {
+      return c.json({ 
+        success: false, 
+        message: `Not enough comments (${comments.length}). Minimum required: ${MIN_COMMENTS_FOR_NOTE}` 
+      }, 400);
+    }
+    
+    console.log(`Processing post ${postUri} with ${comments.length} comments`);
+    
+    // Find clusters of similar comments
+    const similarCommentGroups: Comment[][] = [];
+    const processedIndices = new Set<number>();
+    
+    for (let i = 0; i < comments.length; i++) {
+      if (processedIndices.has(i)) continue;
+      
+      const currentGroup: Comment[] = [comments[i]];
+      processedIndices.add(i);
+      
+      console.log(`Starting new group with comment ${comments[i].id} by ${comments[i].author}`);
+      
+      for (let j = i + 1; j < comments.length; j++) {
+        if (processedIndices.has(j)) continue;
+        
+        const similarity = cosineSimilarity(
+          comments[i].embedding as unknown as number[], 
+          comments[j].embedding as unknown as number[]
+        );
+        
+        console.log(`Similarity between comment ${comments[i].id} and ${comments[j].id}: ${similarity.toFixed(4)} (threshold: ${SIMILARITY_THRESHOLD})`);
+        
+        if (similarity >= SIMILARITY_THRESHOLD) {
+          console.log(`Adding comment ${comments[j].id} to group (similarity: ${similarity.toFixed(4)})`);
+          currentGroup.push(comments[j]);
+          processedIndices.add(j);
+        }
+      }
+      
+      console.log(`Group size: ${currentGroup.length}, minimum required: ${MIN_COMMENTS_FOR_NOTE}`);
+      
+      if (currentGroup.length >= MIN_COMMENTS_FOR_NOTE) {
+        console.log(`Found group of ${currentGroup.length} similar comments, adding to candidates for note generation`);
+        similarCommentGroups.push(currentGroup);
+      }
+    }
+    
+    console.log(`Found ${similarCommentGroups.length} groups of similar comments for post ${postUri}`);
+    
+    if (similarCommentGroups.length === 0) {
+      return c.json({ 
+        success: false, 
+        message: "No groups of similar comments found" 
+      }, 400);
+    }
+    
+    // Generate and post community notes for each group of similar comments
+    const results = [];
+    
+    for (const group of similarCommentGroups) {
+      console.log(`Generating community note for group of ${group.length} comments`);
+      console.log(`Comment texts in group: ${group.map(c => `"${c.text}"`).join(' | ')}`);
+      
+      const noteText = await generateCommunityNote(group);
+      console.log(`Generated note: "${noteText}"`);
+      
+      const commentIds = group.map(c => c.id);
+      
+      // Save the community note
+      const noteId = `note-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      saveCommunityNote(
+        noteId,
+        postUri,
+        group[0].originalPostCid,
+        noteText,
+        commentIds
+      );
+      console.log(`Saved community note with ID: ${noteId}`);
+      
+      // Post the community note as a reply
+      console.log(`Attempting to post community note as reply to ${postUri}`);
+      const posted = await postReply(noteText, postUri, group[0].originalPostCid);
+      
+      results.push({
+        noteId,
+        posted,
+        noteText,
+        commentCount: group.length
+      });
+      
+      if (posted) {
+        console.log(`Successfully posted community note as reply`);
+        // Mark the community note as posted
+        markCommunityNoteAsPosted(noteId);
+        
+        // Mark all comments in the group as processed
+        for (const comment of group) {
+          markCommentAsProcessed(comment.id);
+          console.log(`Marked comment ${comment.id} as processed`);
+        }
+      } else {
+        console.log(`Failed to post community note as reply`);
+      }
+    }
+    
+    return c.json({ 
+      success: true, 
+      message: `Processed post ${postUri}`,
+      results
+    });
+  } catch (error) {
+    console.error("Error processing post:", error);
+    return c.json({ success: false, message: "Error processing post", error: String(error) }, 500);
+  }
+});
+
+app.post("/reset-post", async (c) => {
+  try {
+    const body = await c.req.json();
+    const { postUri, force = false } = body;
+    
+    if (!postUri) {
+      return c.json({ success: false, message: "Missing postUri parameter" }, 400);
+    }
+    
+    // Check if we've already posted a note to this post
+    if (!force) {
+      const hasExistingNote = await hasExistingNoteForPost(postUri);
+      
+      if (hasExistingNote) {
+        return c.json({ 
+          success: false, 
+          message: `Post ${postUri} already has a community note on Bluesky. Use force=true to override.` 
+        }, 400);
+      }
+    }
+    
+    // Delete from processed_posts
+    const deleteProcessedStmt = db.prepare("DELETE FROM processed_posts WHERE uri = ?");
+    deleteProcessedStmt.run(postUri);
+    
+    // Delete community notes
+    deleteCommunityNotesForPost(postUri);
+    
+    // Reset processed flag for comments
+    const resetCommentsStmt = db.prepare("UPDATE comments SET processed = 0 WHERE originalPostUri = ?");
+    resetCommentsStmt.run(postUri);
+    
+    return c.json({ 
+      success: true, 
+      message: `Reset post ${postUri} for reprocessing${force ? ' (forced)' : ''}`
+    });
+  } catch (error) {
+    console.error("Error resetting post:", error);
+    return c.json({ success: false, message: "Error resetting post", error: String(error) }, 500);
+  }
+});
+
+app.get("/check-post", async (c) => {
+  try {
+    const postUri = c.req.query("postUri");
+    
+    if (!postUri) {
+      return c.json({ success: false, message: "Missing postUri parameter" }, 400);
+    }
+    
+    // Check if we've already posted a note to this post
+    const hasExistingNote = await hasExistingNoteForPost(postUri);
+    
+    // Check if the post is marked as processed in our database
+    const isProcessed = isPostProcessed(postUri);
+    
+    // Get comments for this post
+    const comments = getAllCommentsForPost(postUri);
+    
+    return c.json({ 
+      success: true,
+      postUri,
+      hasExistingNote,
+      isProcessedInDb: isProcessed,
+      commentCount: comments.length,
+      hasEnoughComments: comments.length >= MIN_COMMENTS_FOR_NOTE
+    });
+  } catch (error) {
+    console.error("Error checking post:", error);
+    return c.json({ success: false, message: "Error checking post", error: String(error) }, 500);
+  }
+});
+
 // Start the server
 const port = Bun.env.PORT || 3000;
 
 console.log(`Starting server on port ${port}...`);
 console.log(`Bluesky identifier: ${BLUESKY_IDENTIFIER}`);
 
+// Process all comments and mentions
+const processAll = async (): Promise<void> => {
+  try {
+    // First check for new mentions
+    await checkForMentions();
+    
+    // Then process all similar comments
+    await processSimilarComments();
+  } catch (error) {
+    console.error("Error in processAll:", error);
+  }
+};
+
 // Initial login
 loginToBluesky().then(() => {
   // Start periodic checking
-  setInterval(checkForMentions, CHECK_INTERVAL_MS);
+  setInterval(processAll, CHECK_INTERVAL_MS);
 
   // Initial check
-  checkForMentions();
+  processAll();
 });
 
 export default {
